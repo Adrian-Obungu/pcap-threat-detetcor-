@@ -13,7 +13,8 @@ from collections import defaultdict, deque, Counter
 from scapy.all import rdpcap, ARP, IP, TCP, UDP, ICMP, DNS, PcapReader
 from scapy.error import Scapy_Exception
 import sys
-
+import joblib
+import numpy as np
 
 # ----------------------------------------------------------------------
 # Helper functions
@@ -101,7 +102,7 @@ def detect_arp_spoofing(packets, aging_sec=300, change_window_sec=60,
             op = pkt[ARP].op
             ip = pkt[ARP].psrc
             mac = pkt[ARP].hwsrc
-            ts = pkt.time
+            ts = float(pkt.time)
         except (AttributeError, IndexError):
             continue
 
@@ -193,7 +194,7 @@ def detect_port_scan(packets, window_sec=1, threshold=20, whitelist=None):
         if src in whitelist_set:
             continue
         dport = pkt[TCP].dport
-        ts = pkt.time
+        ts = float(pkt.time)
         key = (src, dst)
         scan_flows[key].append((ts, dport))
 
@@ -264,7 +265,7 @@ def detect_dns_tunneling(packets, len_threshold=30, window_sec=10, freq_threshol
             if domain in whitelist_set:
                 continue
 
-            ts = pkt.time
+            ts = float(pkt.time)
 
             # 1. Long domain detection (without break)
             subdomain = '.'.join(domain.split('.')[:-1]) if '.' in domain else domain
@@ -345,7 +346,7 @@ def detect_data_exfiltration(packets, payload_threshold=1000, flow_window_sec=60
             continue
         src = pkt[IP].src
         dst = pkt[IP].dst
-        ts = pkt.time
+        ts = float(pkt.time)
 
         # Determine protocol and payload size
         proto = None
