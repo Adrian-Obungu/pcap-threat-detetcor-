@@ -1,0 +1,34 @@
+flowchart TD
+    subgraph Input
+        A[Network Traffic<br>PCAP or Live Capture]
+    end
+
+    subgraph Processing
+        B{Feature Extraction<br>Flow-level metrics}
+    end
+
+    subgraph Engines
+        C[Rule Engine<br>Deterministic Logic]
+        D[AI Anomaly Engine<br>Isolation Forest]
+    end
+
+    subgraph Alerts
+        E[Immediate Alerts<br>ARP, Scan, Tunneling]
+        F[Anomaly Score<br>Behavioral Deviations]
+    end
+
+    subgraph Output
+        G[Unified Threat Report]
+    end
+
+    A --> B
+    B --> C
+    B --> D
+    C --> E
+    D --> F
+    E --> G
+    F --> G
+
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style G fill:#00ff00,stroke:#333,stroke-width:2px
+    style D fill:#66ccff,stroke:#333,stroke-width:2px
