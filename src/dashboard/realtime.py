@@ -1,23 +1,45 @@
 """
-Background thread for live packet capture and detection.
+Background thread that runs an asyncio event loop for packet ingestion and detection.
 """
 import threading
+import asyncio
 import queue
-import time
-from src.ingest.live_sniffer import sniff_live
-from src.detector.ai_runner import run_hybrid_detection  # we'll adapt later
+from src.utils.logger import setup_logger
 
-alert_queue = queue.Queue()
+logger = setup_logger("dashboard_realtime")
 
-def capture_loop(iface=None):
-    """Capture packets and push alerts into queue."""
-    # For now, simulate alerts
-    while True:
-        # Placeholder: actually run detection on batches of packets
-        time.sleep(5)
-        alert_queue.put({"type": "Simulated", "description": "Test alert", "time": time.time()})
+class AsyncDetectorWorker:
+    def __init__(self, packet_queue: asyncio.Queue, alert_callback):
+        self.packet_queue = packet_queue
+        self.alert_callback = alert_callback
+        self.running = True
 
-def start_background_capture(iface=None):
-    thread = threading.Thread(target=capture_loop, args=(iface,), daemon=True)
+    async def run(self):
+        while self.running:
+            try:
+                pkt = await asyncio.wait_for(self.packet_queue.get(), timeout=1.0)
+                # Placeholder: call your existing ai_runner detection on the packet
+                # For now, just log
+                logger.debug(f"Processing packet from {pkt[IP].src if hasattr(pkt, 'haslayer') else 'unknown'}")
+                # Simulate alert detection
+                # await self.alert_callback({"type": "simulated", "src": pkt[IP].src})
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"Error processing packet: {e}")
+
+def start_background_detection(alert_callback):
+    """Start a background thread with an asyncio event loop for packet ingestion."""
+    packet_queue = asyncio.Queue(maxsize=1000)
+    worker = AsyncDetectorWorker(packet_queue, alert_callback)
+
+    def run_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.create_task(worker.run())
+        # Optionally start ingestor here – for now just keep loop alive
+        loop.run_forever()
+
+    thread = threading.Thread(target=run_loop, daemon=True)
     thread.start()
-    return thread
+    return packet_queue

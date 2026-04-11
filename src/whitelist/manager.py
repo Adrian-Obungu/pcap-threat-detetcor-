@@ -1,105 +1,143 @@
 """
-Whitelist manager with file locking and input validation.
+Whitelist manager with Pydantic validation, atomic file writes, and idempotent operations.
 """
 import os
-import re
-import fcntl
-import time
-from typing import List, Tuple
+import tempfile
+from typing import List, Union, Optional
+from pydantic import BaseModel, Field, field_validator
+import json
 
 WHITELIST_PATH = "data/whitelist/whitelist.txt"
-LOCK_TIMEOUT = 5  # seconds
 
-def _acquire_lock(fd):
-    start = time.time()
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except BlockingIOError:
-            if time.time() - start > LOCK_TIMEOUT:
-                raise TimeoutError("Could not acquire lock on whitelist file")
-            time.sleep(0.1)
+# ---------------------- Pydantic Models ----------------------
+class ARPWhitelistEntry(BaseModel):
+    type: str = "arp"
+    ip: str = Field(..., pattern=r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+    mac: str = Field(..., pattern=r'^[0-9a-fA-F:]{17}$')
 
-def _release_lock(fd):
-    fcntl.flock(fd, fcntl.LOCK_UN)
+    @field_validator('mac')
+    def validate_mac(cls, v):
+        # Normalize to lowercase
+        return v.lower()
 
-def _validate_arp(line: str) -> bool:
-    return bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:[0-9a-fA-F:]{17}$', line))
+class IPWhitelistEntry(BaseModel):
+    type: str = "ip"
+    ip: str = Field(..., pattern=r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
 
-def _validate_ip(line: str) -> bool:
-    return bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', line))
+class DomainWhitelistEntry(BaseModel):
+    type: str = "domain"
+    domain: str = Field(..., pattern=r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}(\.[a-zA-Z0-9][a-zA-Z0-9-]{0,62})+$')
 
-def _validate_domain(line: str) -> bool:
-    # Simple domain validation (no protocol, no path)
-    return bool(re.match(r'^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}(\.[a-zA-Z0-9][a-zA-Z0-9-]{0,62})+$', line))
+class ExfilWhitelistEntry(BaseModel):
+    type: str = "exfil"
+    src: str = Field(..., pattern=r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+    dst: str = Field(..., pattern=r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+    proto: str = Field(..., pattern=r'^(tcp|udp|icmp)$')
 
-def _validate_exfil(line: str) -> bool:
-    # src:dest:proto
-    parts = line.split(':')
-    if len(parts) != 3:
-        return False
-    ip_part = r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}'
-    proto_part = r'tcp|udp|icmp'
-    return bool(re.match(f'^{ip_part}:{ip_part}:{proto_part}$', line))
+WhitelistEntry = Union[ARPWhitelistEntry, IPWhitelistEntry, DomainWhitelistEntry, ExfilWhitelistEntry]
 
-def validate_line(line: str) -> Tuple[bool, str]:
-    """Validate a whitelist entry and return (valid, category)."""
+def parse_line(line: str) -> Optional[WhitelistEntry]:
+    """Parse a raw string line into a Pydantic model, or return None if invalid."""
     line = line.strip()
     if not line or line.startswith('#'):
-        return True, 'comment'
-    if _validate_arp(line):
-        return True, 'arp'
-    if _validate_ip(line):
-        return True, 'port_scan'
-    if _validate_domain(line):
-        return True, 'dns'
-    if _validate_exfil(line):
-        return True, 'exfil'
-    return False, 'invalid'
+        return None
+    # Try ARP
+    if ':' in line and line.count(':') == 1:
+        parts = line.split(':')
+        if len(parts) == 2:
+            try:
+                return ARPWhitelistEntry(ip=parts[0], mac=parts[1])
+            except:
+                pass
+    # Try IP
+    if line.count('.') == 3 and ':' not in line and not any(c.isalpha() for c in line):
+        try:
+            return IPWhitelistEntry(ip=line)
+        except:
+            pass
+    # Try domain
+    if '.' in line and not any(c in line for c in '/:') and not line[0].isdigit():
+        try:
+            return DomainWhitelistEntry(domain=line)
+        except:
+            pass
+    # Try exfil (src:dst:proto)
+    if line.count(':') == 2:
+        parts = line.split(':')
+        if len(parts) == 3:
+            try:
+                return ExfilWhitelistEntry(src=parts[0], dst=parts[1], proto=parts[2])
+            except:
+                pass
+    return None
 
-def load_whitelist() -> List[str]:
-    """Return list of valid whitelist entries (no comments, no empty lines)."""
+def entry_to_string(entry: WhitelistEntry) -> str:
+    """Convert Pydantic model back to plain string for storage."""
+    if entry.type == "arp":
+        return f"{entry.ip}:{entry.mac}"
+    elif entry.type == "ip":
+        return entry.ip
+    elif entry.type == "domain":
+        return entry.domain
+    elif entry.type == "exfil":
+        return f"{entry.src}:{entry.dst}:{entry.proto}"
+    raise ValueError(f"Unknown type: {entry.type}")
+
+# ---------------------- Atomic File Operations ----------------------
+def _read_entries() -> List[WhitelistEntry]:
+    """Read and parse all entries from the whitelist file."""
     if not os.path.exists(WHITELIST_PATH):
         return []
     with open(WHITELIST_PATH, 'r') as f:
-        _acquire_lock(f.fileno())
-        try:
-            lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        finally:
-            _release_lock(f.fileno())
-    return lines
+        lines = f.readlines()
+    entries = []
+    for line in lines:
+        entry = parse_line(line)
+        if entry:
+            entries.append(entry)
+    return entries
 
-def add_whitelist_entry(entry: str) -> bool:
-    """Append a validated entry to the whitelist file."""
-    valid, category = validate_line(entry)
-    if not valid:
+def _write_entries(entries: List[WhitelistEntry]) -> None:
+    """Atomically write entries to the whitelist file using a temporary file."""
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(WHITELIST_PATH), exist_ok=True)
+    # Write to a temporary file in the same directory
+    fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(WHITELIST_PATH), prefix=".whitelist_tmp_")
+    with os.fdopen(fd, 'w') as f:
+        for entry in entries:
+            f.write(entry_to_string(entry) + '\n')
+    # Atomic replace
+    os.replace(temp_path, WHITELIST_PATH)
+
+# ---------------------- Public API (Idempotent) ----------------------
+def load_whitelist() -> List[str]:
+    """Return list of whitelist strings (plain text) for UI display."""
+    entries = _read_entries()
+    return [entry_to_string(e) for e in entries]
+
+def add_whitelist_entry(entry_str: str) -> bool:
+    """Add an entry if valid and not already present. Idempotent."""
+    entry = parse_line(entry_str)
+    if not entry:
         return False
-    with open(WHITELIST_PATH, 'a') as f:
-        _acquire_lock(f.fileno())
-        try:
-            f.write(entry + '\n')
-        finally:
-            _release_lock(f.fileno())
+    current = _read_entries()
+    # Check for duplicate (by string representation)
+    new_str = entry_to_string(entry)
+    if any(entry_to_string(e) == new_str for e in current):
+        return True  # already exists, idempotent success
+    current.append(entry)
+    _write_entries(current)
     return True
 
-def remove_whitelist_entry(entry: str) -> bool:
-    """Remove exact entry line from whitelist file (case‑sensitive)."""
-    if not os.path.exists(WHITELIST_PATH):
+def remove_whitelist_entry(entry_str: str) -> bool:
+    """Remove an entry if it exists. Idempotent."""
+    entry = parse_line(entry_str)
+    if not entry:
         return False
-    with open(WHITELIST_PATH, 'r') as f:
-        _acquire_lock(f.fileno())
-        try:
-            lines = f.readlines()
-        finally:
-            _release_lock(f.fileno())
-    new_lines = [line for line in lines if line.strip() != entry]
-    if len(new_lines) == len(lines):
+    target_str = entry_to_string(entry)
+    current = _read_entries()
+    new_entries = [e for e in current if entry_to_string(e) != target_str]
+    if len(new_entries) == len(current):
         return False  # not found
-    with open(WHITELIST_PATH, 'w') as f:
-        _acquire_lock(f.fileno())
-        try:
-            f.writelines(new_lines)
-        finally:
-            _release_lock(f.fileno())
+    _write_entries(new_entries)
     return True
