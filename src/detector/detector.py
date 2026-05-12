@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 pcap-threat-detector – Enhanced Network PCAP Analyzer
-Detects ARP spoofing, port scans, DNS tunneling, and data exfiltration.
+Detects ARP spoofing, port scans, DNS tunneling, data exfiltration, beaconing, and UA spoofing.
 """
 
 import argparse
@@ -9,12 +9,10 @@ import ipaddress
 import json
 import math
 import re
+import sys
 from collections import defaultdict, deque, Counter
 from scapy.all import rdpcap, ARP, IP, TCP, UDP, ICMP, DNS, PcapReader
 from scapy.error import Scapy_Exception
-import sys
-import joblib
-import numpy as np
 
 # ----------------------------------------------------------------------
 # Helper functions
@@ -23,18 +21,19 @@ def shannon_entropy(s):
     """Calculate Shannon entropy of a string."""
     if not s:
         return 0.0
-    freq = {}
-    for c in s:
-        freq[c] = freq.get(c, 0) + 1
+    freq = Counter(s)
     ent = 0.0
     for count in freq.values():
         p = count / len(s)
         ent -= p * math.log2(p)
     return ent
 
+def get_ngrams(s, n=3):
+    """Generate n-grams from a string."""
+    return [s[i:i+n] for i in range(len(s)-n+1)]
 
 def load_whitelist(filepath):
-    """Load whitelist from file. Each line: ip:mac for ARP, ip for port scan, domain for DNS, or ip:port:proto for exfil."""
+    """Load whitelist from file."""
     whitelist = set()
     if not filepath:
         return whitelist
@@ -45,9 +44,8 @@ def load_whitelist(filepath):
                 if line and not line.startswith('#'):
                     whitelist.add(line)
     except FileNotFoundError:
-        print(f"Warning: Whitelist file {filepath} not found.", file=sys.stderr)
+        pass
     return whitelist
-
 
 def load_internal_subnets(filepath):
     """Load internal subnets from file (CIDR notation)."""
@@ -61,12 +59,11 @@ def load_internal_subnets(filepath):
                 if line and not line.startswith('#'):
                     try:
                         subnets.append(ipaddress.ip_network(line))
-                    except ValueError as e:
-                        print(f"Warning: Invalid subnet {line}: {e}", file=sys.stderr)
+                    except ValueError:
+                        pass
     except FileNotFoundError:
-        print(f"Warning: Internal subnets file {filepath} not found.", file=sys.stderr)
+        pass
     return subnets
-
 
 def is_internal(ip, internal_nets):
     """Check if IP belongs to any internal subnet."""
@@ -79,454 +76,242 @@ def is_internal(ip, internal_nets):
     except ValueError:
         return False
 
+# ----------------------------------------------------------------------
+# Detection functions
+# ----------------------------------------------------------------------
 
-# ----------------------------------------------------------------------
-# Detection functions (enhanced)
-# ----------------------------------------------------------------------
-def detect_arp_spoofing(packets, aging_sec=300, change_window_sec=60,
-                        flap_threshold=3, whitelist=None):
-    """Enhanced ARP spoofing detection with time-based aging and flapping."""
-    ip_history = defaultdict(list)   # ip -> deque of (mac, timestamp)
+def detect_arp_spoofing(packets, aging_sec=300, change_window_sec=60, flap_threshold=3, whitelist=None):
+    """Enhanced ARP spoofing detection."""
+    ip_history = defaultdict(list)
     alerts = []
     reported = set()
-
-    whitelist_set = set()
-    if whitelist:
-        whitelist_set = {f"{line.split(':')[0]}:{line.split(':')[1]}" for line in whitelist if ':' in line}
+    whitelist_set = {f"{line.split(':')[0]}:{line.split(':')[1]}" for line in whitelist if ':' in line} if whitelist else set()
 
     for pkt in packets:
-        if ARP not in pkt:
-            continue
-        # Handle malformed packets
+        if ARP not in pkt: continue
         try:
-            op = pkt[ARP].op
-            ip = pkt[ARP].psrc
-            mac = pkt[ARP].hwsrc
-            ts = float(pkt.time)
-        except (AttributeError, IndexError):
-            continue
+            ip, mac, ts = pkt[ARP].psrc, pkt[ARP].hwsrc, float(pkt.time)
+        except: continue
 
-        # Check Ethernet vs ARP MAC
-        eth_src = pkt.src
-        if eth_src != mac:
+        if pkt.src != mac:
             key = (ip, mac, 'eth-mismatch')
             if key not in reported:
-                alerts.append({
-                    'type': 'ARP Spoofing',
-                    'description': f'Ethernet src {eth_src} != ARP sender MAC {mac} for IP {ip}',
-                    'time': ts
-                })
+                alerts.append({'type': 'ARP Spoofing', 'description': f'Ethernet src {pkt.src} != ARP sender MAC {mac} for IP {ip}', 'time': ts, 'severity': 'HIGH'})
                 reported.add(key)
             continue
 
-        # Skip whitelisted pairs
-        pair = f"{ip}:{mac}"
-        if pair in whitelist_set:
-            continue
+        if f"{ip}:{mac}" in whitelist_set: continue
 
-        # Clean expired entries
-        current = [(m, t) for (m, t) in ip_history[ip] if ts - t <= aging_sec]
-        ip_history[ip] = current
-
-        # Check for existing MAC
+        ip_history[ip] = [(m, t) for (m, t) in ip_history[ip] if ts - t <= aging_sec]
         existing = next(((m, t) for (m, t) in ip_history[ip] if m == mac), None)
         if existing:
-            # Update timestamp
             ip_history[ip] = [(m, ts) if m == mac else (m, t) for (m, t) in ip_history[ip]]
             continue
 
-        # New MAC for this IP
         ip_history[ip].append((mac, ts))
-
-        # If there is a previous MAC, check time difference
         if len(ip_history[ip]) >= 2:
             last_mac, last_time = ip_history[ip][-2]
-            time_diff = ts - last_time
-            if time_diff <= change_window_sec:
-                # Rapid change – suspicious
+            if ts - last_time <= change_window_sec:
                 key = (ip, mac, 'rapid-change')
                 if key not in reported:
-                    alerts.append({
-                        'type': 'ARP Spoofing',
-                        'description': f'IP {ip} changed MAC from {last_mac} to {mac} in {time_diff:.2f}s',
-                        'time': ts
-                    })
+                    alerts.append({'type': 'ARP Spoofing', 'description': f'IP {ip} changed MAC from {last_mac} to {mac} in {ts-last_time:.2f}s', 'time': ts, 'severity': 'HIGH'})
                     reported.add(key)
 
-        # Flapping detection
         if len(ip_history[ip]) > flap_threshold:
             key = (ip, 'flap')
             if key not in reported:
-                alerts.append({
-                    'type': 'ARP Spoofing',
-                    'description': f'IP {ip} flapped MAC {len(ip_history[ip])} times in {aging_sec}s',
-                    'time': ts
-                })
+                alerts.append({'type': 'ARP Spoofing', 'description': f'IP {ip} flapped MAC {len(ip_history[ip])} times', 'time': ts, 'severity': 'CRITICAL'})
                 reported.add(key)
-                # Reset history to avoid repeated alerts
                 ip_history[ip] = [(mac, ts)]
-
     return alerts
 
-
 def detect_port_scan(packets, window_sec=1, threshold=20, whitelist=None):
-    """Enhanced port scan detection with sliding window O(n)."""
-    # Group by (src_ip, dst_ip) to detect scans on single host
-    scan_flows = defaultdict(list)  # (src, dst) -> list of (timestamp, dport)
+    """Enhanced port scan detection."""
+    scan_flows = defaultdict(list)
     alerts = []
     reported = set()
+    whitelist_set = {line for line in whitelist if ':' not in line} if whitelist else set()
 
-    whitelist_set = set()
-    if whitelist:
-        whitelist_set = {line for line in whitelist if ':' not in line}  # simple IP whitelist
-
-    # First pass: collect SYN packets
     for pkt in packets:
-        if IP not in pkt or TCP not in pkt:
-            continue
-        # SYN flag set (0x02) – optionally also include SYN-ACK (0x12)
-        tcp_flags = pkt[TCP].flags
-        if not (tcp_flags & 0x02):
-            continue
-        # Skip packets with ACK (i.e., SYN-ACK) if you want only pure SYNs, but we'll keep them for now
-        src = pkt[IP].src
-        dst = pkt[IP].dst
-        if src in whitelist_set:
-            continue
-        dport = pkt[TCP].dport
-        ts = float(pkt.time)
-        key = (src, dst)
-        scan_flows[key].append((ts, dport))
+        if IP not in pkt or TCP not in pkt: continue
+        if not (pkt[TCP].flags & 0x02): continue
+        src, dst, ts = pkt[IP].src, pkt[IP].dst, float(pkt.time)
+        if src in whitelist_set: continue
+        scan_flows[(src, dst)].append((ts, pkt[TCP].dport))
 
-    # Second pass: sliding window per (src, dst)
-    for (src, dst), packets_list in scan_flows.items():
-        # Packets should be in order; if not, sort (though expensive)
-        if any(packets_list[i][0] > packets_list[i+1][0] for i in range(len(packets_list)-1)):
-            packets_list.sort(key=lambda x: x[0])
-
+    for (src, dst), p_list in scan_flows.items():
+        p_list.sort()
         window = deque()
         ports = set()
-        for ts, dport in packets_list:
+        for ts, dport in p_list:
             window.append((ts, dport))
             ports.add(dport)
-
-            # Remove old packets outside window
             while window and window[0][0] < ts - window_sec:
                 old_ts, old_dport = window.popleft()
-                if old_dport not in [p[1] for p in window]:
-                    ports.discard(old_dport)
-
+                if old_dport not in [p[1] for p in window]: ports.discard(old_dport)
             if len(ports) >= threshold:
                 key = (src, dst, 'scan')
                 if key not in reported:
-                    alerts.append({
-                        'type': 'Port Scan',
-                        'description': f'Source IP {src} contacted {len(ports)} distinct ports to {dst} in {window_sec}s',
-                        'time': ts
-                    })
+                    alerts.append({'type': 'Port Scan', 'description': f'Source {src} scanned {len(ports)} ports on {dst}', 'time': ts, 'severity': 'MEDIUM'})
                     reported.add(key)
-                    # Optionally clear window to avoid repeated alerts for same burst
-                    window.clear()
-                    ports.clear()
-
+                    window.clear(); ports.clear()
     return alerts
 
+def detect_dns_tunneling(packets, len_threshold=30, entropy_threshold=4.5, whitelist=None):
+    """Advanced DNS Tunneling & DGA Detection."""
+    alerts = []
+    reported = set()
+    whitelist_set = set(whitelist) if whitelist else set()
 
-def detect_dns_tunneling(packets, len_threshold=30, window_sec=10, freq_threshold=20,
-                         entropy_threshold=4.5, whitelist=None):
-    """Enhanced DNS tunneling detection with sliding window frequency and entropy."""
+    for pkt in packets:
+        if DNS not in pkt or pkt[DNS].qr != 0: continue
+        try:
+            domain = pkt[DNS].qd.qname.decode().rstrip('.').lower()
+            src, ts = pkt[IP].src, float(pkt.time)
+        except: continue
+
+        if domain in whitelist_set: continue
+        subdomain = '.'.join(domain.split('.')[:-1]) if '.' in domain else domain
+        
+        # 1. Entropy & Length
+        ent = shannon_entropy(subdomain)
+        if len(subdomain) > len_threshold or ent > entropy_threshold:
+            key = (src, domain, 'dns-anomaly')
+            if key not in reported:
+                desc = f"DNS Anomaly: {domain} (Len: {len(subdomain)}, Entropy: {ent:.2f})"
+                alerts.append({'type': 'DNS Tunneling', 'description': desc, 'time': ts, 'severity': 'HIGH'})
+                reported.add(key)
+
+        # 2. DGA-like Character Distribution
+        if len(subdomain) > 10:
+            digits = sum(c.isdigit() for c in subdomain)
+            if digits / len(subdomain) > 0.3:
+                key = (src, domain, 'dga-digits')
+                if key not in reported:
+                    alerts.append({'type': 'DGA Detection', 'description': f"High digit ratio in domain: {domain}", 'time': ts, 'severity': 'MEDIUM'})
+                    reported.add(key)
+    return alerts
+
+def detect_beaconing(packets, window_sec=60, min_count=5, max_jitter=0.2):
+    """Behavioral Beaconing Detection (C2 Heartbeats)."""
+    flows = defaultdict(list)
     alerts = []
     reported = set()
 
-    whitelist_set = set()
-    if whitelist:
-        whitelist_set = {line for line in whitelist if line}  # domain whitelist
-
-    # Store queries per (src_ip, domain) for sliding window
-    query_queues = defaultdict(deque)  # (src, domain) -> deque of timestamps
-    # Also store for response size (optional)
-    # response_sizes = defaultdict(list)  # (src, domain) -> list of (ts, size)
-
     for pkt in packets:
-        if DNS not in pkt:
-            continue
-        # Extract query or response
-        if pkt[DNS].qr == 0:  # query
-            try:
-                domain = pkt[DNS].qd.qname.decode().rstrip('.').lower()
-            except (AttributeError, IndexError):
-                continue
+        if IP not in pkt: continue
+        proto = 'TCP' if TCP in pkt else 'UDP' if UDP in pkt else None
+        if not proto: continue
+        src, dst, ts = pkt[IP].src, pkt[IP].dst, float(pkt.time)
+        dport = pkt[proto].dport
+        flows[(src, dst, dport, proto)].append(ts)
 
-            src = pkt[IP].src if IP in pkt else None
-            if not src:
-                continue
-
-            # Whitelist
-            if domain in whitelist_set:
-                continue
-
-            ts = float(pkt.time)
-
-            # 1. Long domain detection (without break)
-            subdomain = '.'.join(domain.split('.')[:-1]) if '.' in domain else domain
-            if len(subdomain) > len_threshold:
-                key = (src, domain, 'long')
-                if key not in reported:
-                    alerts.append({
-                        'type': 'DNS Tunneling',
-                        'description': f'Long subdomain ({len(subdomain)} chars): {domain}',
-                        'time': ts
-                    })
-                    reported.add(key)
-
-            # 2. Entropy detection
-            if subdomain and shannon_entropy(subdomain) > entropy_threshold:
-                key = (src, domain, 'entropy')
-                if key not in reported:
-                    alerts.append({
-                        'type': 'DNS Tunneling',
-                        'description': f'High entropy ({shannon_entropy(subdomain):.2f}) in {domain}',
-                        'time': ts
-                    })
-                    reported.add(key)
-
-            # 3. Character set detection (base64-like)
-            if re.match(r'^[A-Za-z0-9+/=]+$', subdomain):
-                key = (src, domain, 'base64')
-                if key not in reported:
-                    alerts.append({
-                        'type': 'DNS Tunneling',
-                        'description': f'Base64-like pattern in {domain}',
-                        'time': ts
-                    })
-                    reported.add(key)
-
-            # 4. Frequency sliding window
-            key = (src, domain)
-            dq = query_queues[key]
-            dq.append(ts)
-            # Remove old timestamps
-            while dq and dq[0] < ts - window_sec:
-                dq.popleft()
-            if len(dq) >= freq_threshold:
-                key_alert = (src, domain, 'freq')
-                if key_alert not in reported:
-                    alerts.append({
-                        'type': 'DNS Tunneling',
-                        'description': f'High query frequency ({len(dq)} queries) to {domain} from {src} in {window_sec}s',
-                        'time': ts
-                    })
-                    reported.add(key_alert)
-                    # Clear to avoid repeated alerts for same burst
-                    dq.clear()
-
-        # Optional: response size analysis
-        # else: response – could track large TXT records
-        # (omitted for brevity, but can be added)
-
+    for flow_key, timestamps in flows.items():
+        if len(timestamps) < min_count: continue
+        timestamps.sort()
+        intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1)]
+        avg_interval = sum(intervals) / len(intervals)
+        if avg_interval < 0.1: continue # Ignore high-speed flows
+        
+        jitter = sum(abs(i - avg_interval) for i in intervals) / len(intervals)
+        if jitter / avg_interval <= max_jitter:
+            src, dst, dport, proto = flow_key
+            key = (src, dst, dport, 'beacon')
+            if key not in reported:
+                alerts.append({
+                    'type': 'Beaconing',
+                    'description': f'C2 Beacon detected: {src} -> {dst}:{dport} ({proto}) every {avg_interval:.2f}s (Jitter: {jitter/avg_interval:.2%})',
+                    'time': timestamps[-1],
+                    'severity': 'CRITICAL'
+                })
+                reported.add(key)
     return alerts
 
-
-def detect_data_exfiltration(packets, payload_threshold=1000, flow_window_sec=60,
-                             flow_bytes_threshold=1_000_000, internal_subnets=None,
-                             entropy_threshold=None, whitelist=None):
-    """Enhanced data exfiltration detection with flow-based cumulative tracking."""
+def detect_user_agent_spoofing(packets):
+    """Protocol-Specific Deep Inspection: UA Spoofing."""
     alerts = []
     reported = set()
-
-    whitelist_set = set()
-    if whitelist:
-        whitelist_set = whitelist  # expects entries like "192.168.1.1:443:tcp"
-
-    # Flow tracking: (src, dst, proto) -> deque of (ts, bytes)
-    flow_queues = defaultdict(deque)
+    suspicious_uas = ['sqlmap', 'nmap', 'nikto', 'gobuster', 'python-requests/2.']
 
     for pkt in packets:
-        if IP not in pkt:
-            continue
-        src = pkt[IP].src
-        dst = pkt[IP].dst
-        ts = float(pkt.time)
-
-        # Determine protocol and payload size
-        proto = None
-        payload_len = 0
-        if TCP in pkt:
-            proto = 'tcp'
-            payload_len = len(pkt[TCP].payload) if pkt[TCP].payload else 0
-        elif UDP in pkt:
-            proto = 'udp'
-            payload_len = len(pkt[UDP].payload) if pkt[UDP].payload else 0
-        elif ICMP in pkt:
-            proto = 'icmp'
-            # Filter ICMP types: Echo Request (8), Timestamp (13), Address Mask Request (17)
-            icmp_type = pkt[ICMP].type
-            if icmp_type not in [8, 13, 17]:
-                continue
-            payload_len = len(pkt[ICMP].payload) if pkt[ICMP].payload else 0
-
-        if not proto:
-            continue
-
-        # Direction check: only outbound traffic if internal subnets provided
-        if internal_subnets:
-            src_internal = is_internal(src, internal_subnets)
-            dst_internal = is_internal(dst, internal_subnets)
-            is_outbound = src_internal and not dst_internal
-            if not is_outbound:
-                continue
-
-        # Whitelist check (simple: IP:port:proto)
-        whitelist_key = f"{src}:{dst}:{proto}"
-        if whitelist_key in whitelist_set:
-            continue
-
-        # Single-packet large payload
-        if payload_len > payload_threshold:
-            key = (src, dst, proto, 'single')
-            if key not in reported:
-                alerts.append({
-                    'type': 'Data Exfiltration',
-                    'description': f'Large {proto} packet of {payload_len} bytes from {src} to {dst}',
-                    'time': ts
-                })
-                reported.add(key)
-
-        # Flow-based cumulative tracking
-        flow_key = (src, dst, proto)
-        dq = flow_queues[flow_key]
-        dq.append((ts, payload_len))
-
-        # Remove old entries
-        while dq and dq[0][0] < ts - flow_window_sec:
-            dq.popleft()
-
-        total_bytes = sum(entry[1] for entry in dq)
-        if total_bytes > flow_bytes_threshold:
-            key = (src, dst, proto, 'flow')
-            if key not in reported:
-                alerts.append({
-                    'type': 'Data Exfiltration',
-                    'description': f'High {proto} flow: {total_bytes} bytes from {src} to {dst} in {flow_window_sec}s',
-                    'time': ts
-                })
-                reported.add(key)
-                # Optionally clear the queue to avoid repeated alerts for same flow
-                dq.clear()
-
-        # Optional: entropy analysis on payload
-        if entropy_threshold and payload_len > 100:  # only if significant payload
-            try:
-                payload = bytes(pkt[proto].payload) if pkt[proto].payload else b''
-                if payload:
-                    ent = shannon_entropy(payload)
-                    if ent > entropy_threshold:
-                        key = (src, dst, proto, 'entropy')
+        if TCP not in pkt or pkt[TCP].dport != 80: continue
+        try:
+            payload = bytes(pkt[TCP].payload).decode('utf-8', errors='ignore')
+            if 'User-Agent:' in payload:
+                ua_line = [l for l in payload.split('\r\n') if 'User-Agent:' in l][0]
+                ua = ua_line.split(':', 1)[1].strip()
+                src, ts = pkt[IP].src, float(pkt.time)
+                
+                for suspect in suspicious_uas:
+                    if suspect.lower() in ua.lower():
+                        key = (src, suspect, 'ua-spoof')
                         if key not in reported:
-                            alerts.append({
-                                'type': 'Data Exfiltration',
-                                'description': f'High entropy ({ent:.2f}) {proto} payload from {src} to {dst}',
-                                'time': ts
-                            })
+                            alerts.append({'type': 'UA Spoofing', 'description': f'Suspicious User-Agent from {src}: {ua}', 'time': ts, 'severity': 'HIGH'})
                             reported.add(key)
-            except Exception:
-                pass
-
+        except: continue
     return alerts
 
+def detect_data_exfiltration(packets, threshold=1_000_000, internal_nets=None):
+    """Flow-based Data Exfiltration Detection."""
+    flows = defaultdict(int)
+    alerts = []
+    reported = set()
+
+    for pkt in packets:
+        if IP not in pkt: continue
+        src, dst, ts = pkt[IP].src, pkt[IP].dst, float(pkt.time)
+        if internal_nets and (not is_internal(src, internal_nets) or is_internal(dst, internal_nets)): continue
+        
+        size = len(pkt)
+        flows[(src, dst)] += size
+        if flows[(src, dst)] > threshold:
+            key = (src, dst, 'exfil')
+            if key not in reported:
+                alerts.append({'type': 'Data Exfiltration', 'description': f'High volume flow: {src} -> {dst} ({flows[(src, dst)]/1e6:.2f} MB)', 'time': ts, 'severity': 'CRITICAL'})
+                reported.add(key)
+    return alerts
 
 # ----------------------------------------------------------------------
-# Main processing
+# Main Execution
 # ----------------------------------------------------------------------
 def process_pcap(filepath, args):
-    """Stream PCAP and run detectors, returning aggregated alerts."""
-    alerts = []
     try:
-        packets = rdpcap(filepath)  # loads all into memory; could also use PcapReader for streaming
-        # (For large files, we could use PcapReader and pass generator to detectors, but many detectors need full packet list)
-        # For simplicity we load all. For memory efficiency, consider using PcapReader and storing only necessary info.
-        # We'll leave as is for now.
+        packets = rdpcap(filepath)
     except Exception as e:
-        print(f"Error reading PCAP: {e}", file=sys.stderr)
-        return []
+        return [{'type': 'System Error', 'description': f'Failed to read PCAP: {str(e)}', 'time': 0, 'severity': 'LOW'}]
 
-    # Load whitelist and internal subnets if provided
-    whitelist = None
-    if args.whitelist:
-        whitelist = load_whitelist(args.whitelist)
-    internal_nets = None
-    if args.internal_subnets:
-        internal_nets = load_internal_subnets(args.internal_subnets)
-
-    # Run detectors
-    alerts.extend(detect_arp_spoofing(packets,
-                                      aging_sec=args.arp_aging_sec,
-                                      change_window_sec=args.arp_change_window_sec,
-                                      flap_threshold=args.arp_flap_threshold,
-                                      whitelist=whitelist))
-
-    alerts.extend(detect_port_scan(packets,
-                                   window_sec=args.port_window_sec,
-                                   threshold=args.port_threshold,
-                                   whitelist=whitelist))
-
-    alerts.extend(detect_dns_tunneling(packets,
-                                       len_threshold=args.dns_len_threshold,
-                                       window_sec=args.dns_window_sec,
-                                       freq_threshold=args.dns_freq_threshold,
-                                       entropy_threshold=args.dns_entropy_threshold,
-                                       whitelist=whitelist))
-
-    alerts.extend(detect_data_exfiltration(packets,
-                                           payload_threshold=args.exfil_payload_threshold,
-                                           flow_window_sec=args.exfil_flow_window_sec,
-                                           flow_bytes_threshold=args.exfil_flow_bytes_threshold,
-                                           internal_subnets=internal_nets,
-                                           entropy_threshold=args.exfil_entropy_threshold,
-                                           whitelist=whitelist))
-
+    whitelist = load_whitelist(args.whitelist)
+    internal_nets = load_internal_subnets(args.internal_subnets)
+    
+    alerts = []
+    alerts.extend(detect_arp_spoofing(packets, whitelist=whitelist))
+    alerts.extend(detect_port_scan(packets, threshold=args.port_threshold, whitelist=whitelist))
+    alerts.extend(detect_dns_tunneling(packets, whitelist=whitelist))
+    alerts.extend(detect_beaconing(packets))
+    alerts.extend(detect_user_agent_spoofing(packets))
+    alerts.extend(detect_data_exfiltration(packets, internal_nets=internal_nets))
+    
+    # Correlation Hook: Add correlation_id to all alerts
+    for alert in alerts:
+        alert['correlation_id'] = f"corr_{int(alert['time'])}"
+        
     return alerts
 
-
 def main():
-    parser = argparse.ArgumentParser(description='Enhanced PCAP threat detector')
+    parser = argparse.ArgumentParser(description='Enterprise PCAP Threat Detector')
     parser.add_argument('pcap_file', help='Path to PCAP file')
     parser.add_argument('--json', action='store_true', help='Output in JSON format')
-    parser.add_argument('--whitelist', help='Whitelist file (format depends on detector)')
-    parser.add_argument('--internal-subnets', help='File with CIDR subnets for internal networks')
-
-    # ARP detection parameters
-    parser.add_argument('--arp-aging-sec', type=int, default=300, help='ARP aging window (seconds)')
-    parser.add_argument('--arp-change-window-sec', type=int, default=60, help='Time window for rapid MAC change')
-    parser.add_argument('--arp-flap-threshold', type=int, default=3, help='Flapping MAC count threshold')
-
-    # Port scan detection parameters
-    parser.add_argument('--port-window-sec', type=int, default=1, help='Port scan time window (seconds)')
-    parser.add_argument('--port-threshold', type=int, default=20, help='Number of distinct ports in window to alert')
-
-    # DNS detection parameters
-    parser.add_argument('--dns-len-threshold', type=int, default=30, help='Subdomain length threshold')
-    parser.add_argument('--dns-window-sec', type=int, default=10, help='DNS frequency time window')
-    parser.add_argument('--dns-freq-threshold', type=int, default=20, help='DNS query frequency threshold')
-    parser.add_argument('--dns-entropy-threshold', type=float, default=4.5, help='Shannon entropy threshold')
-
-    # Exfiltration detection parameters
-    parser.add_argument('--exfil-payload-threshold', type=int, default=1000, help='Single packet payload size threshold')
-    parser.add_argument('--exfil-flow-window-sec', type=int, default=60, help='Flow time window for cumulative bytes')
-    parser.add_argument('--exfil-flow-bytes-threshold', type=int, default=1_000_000, help='Cumulative bytes threshold')
-    parser.add_argument('--exfil-entropy-threshold', type=float, default=None, help='Payload entropy threshold (optional)')
-
+    parser.add_argument('--whitelist', help='Whitelist file')
+    parser.add_argument('--internal-subnets', help='Internal subnets file')
+    parser.add_argument('--port-threshold', type=int, default=20)
     args = parser.parse_args()
 
     alerts = process_pcap(args.pcap_file, args)
-
     if args.json:
         print(json.dumps(alerts, indent=2))
     else:
-        print(f"[+] Total alerts: {len(alerts)}")
-        for alert in alerts:
-            print(f"[!] {alert['type']}: {alert['description']} (time: {alert['time']})")
-
+        for a in alerts:
+            print(f"[{a['severity']}] {a['type']}: {a['description']}")
 
 if __name__ == '__main__':
     main()
