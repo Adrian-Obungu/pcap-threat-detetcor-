@@ -1,0 +1,8 @@
+# ARP whitelist: IP:MAC
+192.168.1.1:00:11:22:33:44:55
+# Port scan whitelist: source IP
+10.0.0.5
+# DNS whitelist: domain
+example.com
+# Exfiltration whitelist: src:dest:proto
+192.168.1.100:8.8.8.8:icmp

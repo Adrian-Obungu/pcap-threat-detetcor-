@@ -1,0 +1,156 @@
+{
+  "project_info": {
+    "title": "Hybrid AI-Driven IDS: Bridging the Gap in Network Threat Detection",
+    "created": 1775812325.5318532,
+    "last_updated": 1775812699.1487062,
+    "total_slides": 12
+  },
+  "slides": [
+    {
+      "id": "title_slide",
+      "state": "edited",
+      "pageNum": 1
+    },
+    {
+      "id": "evolving_threat_landscape",
+      "state": "edited",
+      "pageNum": 2
+    },
+    {
+      "id": "introducing_hybrid_approach",
+      "state": "edited",
+      "pageNum": 3
+    },
+    {
+      "id": "deterministic_rule_engine",
+      "state": "edited",
+      "pageNum": 4
+    },
+    {
+      "id": "ai_anomaly_engine",
+      "state": "edited",
+      "pageNum": 5
+    },
+    {
+      "id": "feature_extraction",
+      "state": "edited",
+      "pageNum": 6
+    },
+    {
+      "id": "training_ai_model",
+      "state": "edited",
+      "pageNum": 7
+    },
+    {
+      "id": "testing_validation",
+      "state": "edited",
+      "pageNum": 8
+    },
+    {
+      "id": "hybrid_architecture_overview",
+      "state": "edited",
+      "pageNum": 9
+    },
+    {
+      "id": "limitations_future_work",
+      "state": "edited",
+      "pageNum": 10
+    },
+    {
+      "id": "conclusion",
+      "state": "edited",
+      "pageNum": 11
+    },
+    {
+      "id": "attribution_contact",
+      "state": "edited",
+      "pageNum": 12
+    }
+  ],
+  "outline": [
+    {
+      "id": "title_slide",
+      "title": "Hybrid AI-Driven IDS: Bridging the Gap in Network Threat Detection",
+      "summary": "Introduction to the hybrid AI-driven Intrusion Detection System, its purpose, and developer attribution.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "evolving_threat_landscape",
+      "title": "Traditional PCAP Analysis Falls Short Against Modern Threats",
+      "summary": "Discusses the limitations of traditional PCAP analysis in the face of encrypted traffic, zero-day exploits, and Living Off the Land attacks.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "introducing_hybrid_approach",
+      "title": "Combining Deterministic Rules with AI for Comprehensive Coverage",
+      "summary": "Explains the dual-engine architecture that integrates rule-based and AI-driven detection for enhanced visibility.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "deterministic_rule_engine",
+      "title": "Rapid & Reliable Detection of Known Attack Patterns",
+      "summary": "Details the rule-based detection methods for ARP spoofing, port scanning, DNS tunneling, and data exfiltration.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "ai_anomaly_engine",
+      "title": "Unsupervised Learning for Novel Threat Identification",
+      "summary": "Introduces the Isolation Forest model, its focus on flow-level metrics, and its ability to detect novel threats without prior knowledge.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "feature_extraction",
+      "title": "Transforming Raw PCAP Data into Actionable Features",
+      "summary": "Describes the process of flow aggregation and extraction of key features for AI analysis using `feature_extractor.py`.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "training_ai_model",
+      "title": "Defining \"Normal\" with Synthetic & Real-World Data",
+      "summary": "Explains the training methodology using synthetic normal flows and the CSE-CIC-IDS2018 dataset, and the role of `train_ai_model.py`.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "testing_validation",
+      "title": "Dual Detection of a Synthetic Data Exfiltration Attempt",
+      "summary": "Presents a concrete example of a data exfiltration scenario detected by both the rule engine and the AI model, including anomaly scores.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "hybrid_architecture_overview",
+      "title": "A Unified Pipeline for Comprehensive Threat Detection",
+      "summary": "Provides a visual overview of the hybrid architecture, highlighting network traffic ingestion, parallel processing, and integrated reporting.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "limitations_future_work",
+      "title": "Addressing Challenges and Expanding Capabilities",
+      "summary": "Discusses current limitations such as encrypted traffic analysis and outlines future plans including live capture, web interface, and advanced AI techniques.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "conclusion",
+      "title": "The Future of IDS: A Synergistic Blend of Rules and AI",
+      "summary": "Summarizes the key takeaways: moving beyond signatures, resilience against novel threats, cloud-native development, and continuous evolution.",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    },
+    {
+      "id": "attribution_contact",
+      "title": "Thank You! Questions?",
+      "summary": "Final slide for attribution to Adrian S. Obungu and contact information (LinkedIn, GitHub).",
+      "image_plan": "Use a suitable image if needed",
+      "slide_template_key": ""
+    }
+  ]
+}
