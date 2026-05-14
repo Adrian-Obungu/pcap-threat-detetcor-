@@ -7,7 +7,7 @@ Usage: python ai_detector.py <pcap_file>
 import argparse
 import json
 import joblib
-from feature_extractor import extract_features
+from src.detector.feature_extractor import extract_features
 
 def main():
     parser = argparse.ArgumentParser(description='AI anomaly detection on PCAP flows')

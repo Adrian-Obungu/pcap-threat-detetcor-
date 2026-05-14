@@ -9,7 +9,7 @@ import subprocess
 import json
 import sys
 import os
-from feature_extractor import extract_features
+from src.detector.feature_extractor import extract_features
 import joblib
 
 def run_rule_detector(pcap_file):

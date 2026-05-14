@@ -1,83 +1,118 @@
 #!/usr/bin/env python3
 """
-ai_runner.py – Combined rule‑based and AI anomaly detection.
-Usage: python ai_runner.py <pcap_file> [--ai]
+feature_extractor.py – Extract per-flow statistical features from a PCAP file.
+
+Each flow is identified by a 5-tuple: (src_ip, dst_ip, src_port, dst_port, proto).
+Returns a list of feature dicts compatible with the Isolation Forest model.
+
+Feature columns (must match training order in train_ai_model.py):
+  packet_count, total_bytes, duration_sec, packets_per_sec,
+  bytes_per_sec, mean_packet_size, variance_packet_size, stddev_packet_size
 """
 
-import argparse
-import subprocess
-import json
-import sys
-import os
-from feature_extractor import extract_features
-import joblib
+import math
+from collections import defaultdict
+from scapy.all import rdpcap, IP, TCP, UDP
 
-def run_rule_detector(pcap_file):
-    """Run the original detector.py and return its alerts as a list."""
-    # Use subprocess to capture JSON output
-    result = subprocess.run(
-        ['python', 'detector.py', pcap_file, '--json'],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(f"Rule detector error: {result.stderr}", file=sys.stderr)
-        return []
+
+def extract_features(pcap_file: str) -> list:
+    """
+    Read a PCAP file and return a list of per-flow feature dicts.
+
+    Each dict contains:
+      src_ip, dst_ip, src_port, dst_port, protocol,
+      packet_count, total_bytes, duration_sec,
+      packets_per_sec, bytes_per_sec,
+      mean_packet_size, variance_packet_size, stddev_packet_size
+    """
     try:
-        alerts = json.loads(result.stdout)
-        return alerts
-    except json.JSONDecodeError:
+        packets = rdpcap(pcap_file)
+    except Exception as e:
+        print(f"Error reading PCAP {pcap_file}: {e}")
         return []
 
-def run_ai_detector(pcap_file):
-    """Load AI model and return anomaly alerts."""
-    model_path = 'models/anomaly_model.pkl'
-    if not os.path.exists(model_path):
-        print("AI model not found. Train it first with python train_ai_model.py", file=sys.stderr)
-        return []
-    model = joblib.load(model_path)
-    features_list = extract_features(pcap_file)
-    if not features_list:
-        return []
-    X = []
-    for f in features_list:
-        X.append([
-            f['packet_count'],
-            f['total_bytes'],
-            f['duration_sec'],
-            f['packets_per_sec'],
-            f['bytes_per_sec'],
-            f['mean_packet_size'],
-            f['variance_packet_size'],
-            f['stddev_packet_size']
-        ])
-    scores = model.decision_function(X)
-    predictions = model.predict(X)  # -1 = anomaly
-    ai_alerts = []
-    for i, pred in enumerate(predictions):
-        if pred == -1:
-            f = features_list[i]
-            ai_alerts.append({
-                'type': 'AI Anomaly',
-                'description': f"Flow {f['src_ip']} -> {f['dst_ip']} ({f['protocol']}) | Score: {scores[i]:.4f}",
-                'time': None
-            })
-    return ai_alerts
+    # Flow accumulator: key -> {sizes: [], timestamps: []}
+    flows = defaultdict(lambda: {"sizes": [], "timestamps": []})
 
-def main():
-    parser = argparse.ArgumentParser(description='Hybrid threat detector (rules + AI)')
-    parser.add_argument('pcap_file', help='Path to PCAP file')
-    parser.add_argument('--ai', action='store_true', help='Enable AI anomaly detection')
-    args = parser.parse_args()
-    alerts = []
-    # Always run rule detector
-    alerts.extend(run_rule_detector(args.pcap_file))
-    if args.ai:
-        alerts.extend(run_ai_detector(args.pcap_file))
-    # Output
-    print(f"[+] Total alerts: {len(alerts)}")
-    for alert in alerts:
-        time_str = f" (time: {alert['time']})" if alert['time'] else ""
-        print(f"[!] {alert['type']}: {alert['description']}{time_str}")
+    for pkt in packets:
+        if IP not in pkt:
+            continue
+        ip = pkt[IP]
+        src_ip = ip.src
+        dst_ip = ip.dst
+        proto = ip.proto
+        src_port = None
+        dst_port = None
 
-if __name__ == '__main__':
-    main()
+        if TCP in pkt:
+            src_port = pkt[TCP].sport
+            dst_port = pkt[TCP].dport
+        elif UDP in pkt:
+            src_port = pkt[UDP].sport
+            dst_port = pkt[UDP].dport
+
+        key = (src_ip, dst_ip, src_port, dst_port, proto)
+        ts = float(pkt.time)
+        size = len(pkt)
+
+        flows[key]["sizes"].append(size)
+        flows[key]["timestamps"].append(ts)
+
+    features = []
+    proto_map = {6: "TCP", 17: "UDP", 1: "ICMP"}
+
+    for (src_ip, dst_ip, src_port, dst_port, proto_num), data in flows.items():
+        sizes = data["sizes"]
+        timestamps = data["timestamps"]
+        n = len(sizes)
+
+        if n == 0:
+            continue
+
+        total_bytes = sum(sizes)
+        start_time = min(timestamps)
+        end_time = max(timestamps)
+        duration_sec = max(end_time - start_time, 1e-6)  # avoid division by zero
+
+        packets_per_sec = n / duration_sec
+        bytes_per_sec = total_bytes / duration_sec
+        mean_size = total_bytes / n
+
+        # Variance and stddev of packet sizes
+        if n > 1:
+            variance = sum((s - mean_size) ** 2 for s in sizes) / n
+        else:
+            variance = 0.0
+        stddev = math.sqrt(variance)
+
+        features.append({
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "src_port": src_port,
+            "dst_port": dst_port,
+            "protocol": proto_map.get(proto_num, str(proto_num)),
+            "packet_count": n,
+            "total_bytes": total_bytes,
+            "duration_sec": duration_sec,
+            "packets_per_sec": packets_per_sec,
+            "bytes_per_sec": bytes_per_sec,
+            "mean_packet_size": mean_size,
+            "variance_packet_size": variance,
+            "stddev_packet_size": stddev,
+        })
+
+    return features
+
+
+if __name__ == "__main__":
+    import sys
+    import json
+
+    if len(sys.argv) < 2:
+        print("Usage: python feature_extractor.py <pcap_file>")
+        sys.exit(1)
+
+    feats = extract_features(sys.argv[1])
+    print(f"Extracted {len(feats)} flows.")
+    if feats:
+        print(json.dumps(feats[:3], indent=2))
